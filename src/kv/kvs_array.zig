@@ -10,5 +10,5 @@ pub const Array = struct {
     count: i32,
 };
 
-const KVS_ARRAY_SIZE = 1048576;
+const kvs_array_size = 1048576;
 const std = @import("std");
