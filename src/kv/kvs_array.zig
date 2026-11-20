@@ -11,7 +11,7 @@ const InsertResult = enum {
     exists,
 };
 
-const Array = struct {
+pub const Array = struct {
     table: []Item,
     // 已使用槽位数
     used: u32 = 0,
@@ -22,6 +22,7 @@ const Array = struct {
     const Self = @This();
     const max_capacity = 1048576;
     const InsertError = error{TableFull} || Allocator.Error;
+    const ModifyError = error{NotFound} || Allocator.Error;
 
     pub fn init(allocator: Allocator) !Self {
         return initCapacity(allocator, max_capacity);
@@ -66,6 +67,7 @@ const Array = struct {
         };
 
         const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
         const value_copy = try self.allocator.dupe(u8, value);
 
         self.table[position] = .{ .key = key_copy, .vaule = value_copy };
@@ -77,7 +79,7 @@ const Array = struct {
     }
 
     pub fn get(self: *Self, key: []u8) ?[]u8 {
-        for (self.table) |slot| {
+        for (self.table[0..self.total]) |slot| {
             if (slot.key) |stored_key| {
                 if (std.mem.eql(u8, stored_key, key)) {
                     return slot.value;
@@ -87,6 +89,45 @@ const Array = struct {
         return null;
     }
 
+    pub fn modify(self: *Self, key: []u8, value: []u8) !void {
+        for (self.table[0..self.total]) |slot| {
+            if (slot.key) |stored_key| {
+                if (std.mem.eql(u8, stored_key, key)) {
+                    if (slot.value.len >= value.len) {
+                        @memcpy(slot.value, value);
+                        return;
+                    } else {
+                        const value_copy = try self.allocator.dupe(u8, value);
+                        self.allocator.free(value);
+                        value = value_copy;
+                        return;
+                    }
+                }
+            }
+        }
+        return ModifyError.NotFound;
+    }
+
+    pub fn delete(self: *Self, key: []u8) !void {
+        for (self.table[0..self.total]) |slot| {
+            if (slot.key) |stored_key| {
+                if (std.mem.eql(u8, stored_key, key)) {
+                    self.allocator.free(slot.value);
+                    self.allocator.free(slot.key);
+                    slot.key = null;
+                    slot.value = null;
+                }
+            }
+        }
+    }
+
+    pub fn exist(self: *Self, key: []u8) bool {
+        if (self.get(key)) |_| {
+            return true;
+        } else {
+            return false;
+        }
+    }
     pub fn count(self: *Self) u32 {
         return self.used;
     }
