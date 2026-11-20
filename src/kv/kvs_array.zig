@@ -53,8 +53,8 @@ pub const Array = struct {
     }
 
     pub fn insert(self: *Self, key: []const u8, value: []const u8) !InsertResult {
-        var first_free: ?u32 = null;
-        for (self.table, 0..) |slot, i| {
+        var first_free: ?usize = null;
+        for (self.table[0..self.total], 0..) |slot, i| {
             if (slot.key) |stored_key| {
                 if (std.mem.eql(u8, stored_key, key)) {
                     return .exists;
@@ -93,12 +93,13 @@ pub const Array = struct {
 
     // true修改成功，false键不存在
     pub fn modify(self: *Self, key: []const u8, value: []const u8) !bool {
-        for (self.table[0..self.total]) |slot| {
+        for (self.table[0..self.total]) |*slot| {
             const stored_key = slot.key orelse continue;
             if (!std.mem.eql(u8, stored_key, key)) continue;
 
             const new_value = try self.allocator.dupe(u8, value);
             self.allocator.free(slot.value);
+            // 此时slot是指针，可以直接用slot修改
             slot.value = new_value;
             return true;
         }
@@ -113,8 +114,9 @@ pub const Array = struct {
             const stored_key = slot.key orelse continue;
             // 否定走continue，少一层括号
             if (!std.mem.eql(u8, stored_key, key)) continue;
+            // free不能传?[]u8
             self.allocator.free(stored_key);
-            self.allocator.free(slot.key);
+            self.allocator.free(slot.value);
             self.table[i] = .{};
 
             if (i == self.total - 1) self.total -= 1;
