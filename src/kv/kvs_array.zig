@@ -133,4 +133,166 @@ pub const Array = struct {
     pub fn count(self: *const Self) u32 {
         return self.used;
     }
+
+    pub fn capacity(self: *const Self) usize {
+        return self.table.len;
+    }
 };
+
+// ============================== 测试 ==============================
+
+test "基本生命周期：insert / get / exist / mod / del / count" {
+    var arr = try Array.initCapacity(std.testing.allocator, 8);
+    defer arr.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), arr.count());
+    try std.testing.expectEqual(@as(usize, 8), arr.capacity());
+
+    try std.testing.expectEqual(InsertResult.inserted, try arr.insert("name", "inazuma"));
+    try std.testing.expectEqual(InsertResult.inserted, try arr.insert("lang", "zig"));
+    try std.testing.expectEqual(@as(usize, 2), arr.count());
+
+    try std.testing.expectEqualSlices(u8, "inazuma", arr.get("name").?);
+    try std.testing.expect(arr.exist("lang"));
+    try std.testing.expect(!arr.exist("missing"));
+    try std.testing.expect(arr.get("missing") == null);
+
+    // 键已存在：不覆盖，返回 .exists（保持 C 版语义）
+    try std.testing.expectEqual(InsertResult.exists, try arr.insert("name", "other"));
+    try std.testing.expectEqualSlices(u8, "inazuma", arr.get("name").?);
+    try std.testing.expectEqual(@as(usize, 2), arr.count());
+
+    // 修改
+    try std.testing.expect(try arr.modify("lang", "zig-0.18"));
+    try std.testing.expectEqualSlices(u8, "zig-0.18", arr.get("lang").?);
+    try std.testing.expect(!try arr.modify("nope", "x"));
+
+    // 删除
+    try std.testing.expect(arr.delete("name"));
+    try std.testing.expect(!arr.delete("name"));
+    try std.testing.expectEqual(@as(usize, 1), arr.count());
+    try std.testing.expect(arr.get("name") == null);
+}
+
+test "二进制安全：key/value 中含 0x00 也能精确区分" {
+    var arr = try Array.initCapacity(std.testing.allocator, 8);
+    defer arr.deinit();
+
+    const k1 = "a\x00b";
+    const k2 = "a\x00c";
+    const v1 = "\x00\x01\x00";
+    const v2 = "plain";
+
+    try std.testing.expectEqual(InsertResult.inserted, try arr.insert(k1, v1));
+    try std.testing.expectEqual(InsertResult.inserted, try arr.insert(k2, v2));
+
+    try std.testing.expectEqual(@as(usize, 2), arr.count());
+    try std.testing.expectEqualSlices(u8, v1, arr.get(k1).?);
+    try std.testing.expectEqualSlices(u8, v2, arr.get(k2).?);
+
+    // 前缀相同、长度不同 / 内容不同，都不能误命中
+    try std.testing.expect(arr.get("a") == null);
+    try std.testing.expect(arr.get("a\x00") == null);
+
+    try std.testing.expect(arr.delete(k1));
+    try std.testing.expect(arr.get(k1) == null);
+    try std.testing.expectEqualSlices(u8, v2, arr.get(k2).?);
+}
+
+test "空洞复用：删除中间元素后插入，不推高水位线" {
+    var arr = try Array.initCapacity(std.testing.allocator, 8);
+    defer arr.deinit();
+
+    _ = try arr.insert("a", "1");
+    _ = try arr.insert("b", "2");
+    _ = try arr.insert("c", "3");
+    try std.testing.expectEqual(@as(usize, 3), arr.total);
+
+    try std.testing.expect(arr.delete("b"));
+    try std.testing.expectEqual(@as(usize, 3), arr.total); // 非尾部删除，不收缩
+    try std.testing.expectEqual(@as(usize, 2), arr.count());
+
+    // 新键应复用 b 留下的空洞，而不是追加到 total 之后
+    try std.testing.expectEqual(InsertResult.inserted, try arr.insert("d", "4"));
+    try std.testing.expectEqual(@as(usize, 3), arr.total);
+    try std.testing.expectEqual(@as(usize, 3), arr.count());
+
+    try std.testing.expectEqualSlices(u8, "1", arr.get("a").?);
+    try std.testing.expectEqualSlices(u8, "3", arr.get("c").?);
+    try std.testing.expectEqualSlices(u8, "4", arr.get("d").?);
+}
+
+test "尾部删除收缩高水位线，并可重新尾插" {
+    var arr = try Array.initCapacity(std.testing.allocator, 8);
+    defer arr.deinit();
+
+    _ = try arr.insert("a", "1");
+    _ = try arr.insert("b", "2");
+    try std.testing.expectEqual(@as(usize, 2), arr.total);
+
+    try std.testing.expect(arr.delete("b"));
+    try std.testing.expectEqual(@as(usize, 1), arr.total); // 尾部删除，收缩
+
+    _ = try arr.insert("c", "3");
+    try std.testing.expectEqual(@as(usize, 2), arr.total);
+    try std.testing.expectEqualSlices(u8, "3", arr.get("c").?);
+}
+
+test "容量上限：表满返回 error.TableFull" {
+    var arr = try Array.initCapacity(std.testing.allocator, 2);
+    defer arr.deinit();
+
+    _ = try arr.insert("a", "1");
+    _ = try arr.insert("b", "2");
+    try std.testing.expectError(error.TableFull, arr.insert("c", "3"));
+
+    // 已存在的 key 在满表时仍应返回 .exists，而不是 TableFull
+    try std.testing.expectEqual(InsertResult.exists, try arr.insert("a", "999"));
+
+    // 删除一个后重新可插入
+    try std.testing.expect(arr.delete("a"));
+    try std.testing.expectEqual(InsertResult.inserted, try arr.insert("c", "3"));
+}
+
+test "set 的 OOM 回滚：key 分配成功、value 分配失败时无泄漏" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var arr = try Array.initCapacity(failing.allocator(), 4);
+    defer arr.deinit();
+
+    // 表格分配占 1 次；让下一次（key）成功，随后（value）失败
+    failing.fail_index = failing.alloc_index + 1;
+    try std.testing.expectError(error.OutOfMemory, arr.insert("k", "v"));
+
+    // errdefer 应已释放 key，计数与水位线都保持原样
+    try std.testing.expectEqual(@as(usize, 0), arr.total);
+    try std.testing.expectEqual(@as(usize, 0), arr.count());
+    try std.testing.expect(arr.get("k") == null);
+}
+
+test "mod 的 OOM 安全性：新值分配失败时旧值仍有效" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var arr = try Array.initCapacity(failing.allocator(), 4);
+    defer arr.deinit();
+
+    try std.testing.expectEqual(InsertResult.inserted, try arr.insert("k", "old"));
+
+    failing.fail_index = failing.alloc_index; // 让下一次分配直接失败
+    try std.testing.expectError(error.OutOfMemory, arr.modify("k", "a-much-longer-value"));
+
+    try std.testing.expectEqualSlices(u8, "old", arr.get("k").?);
+    try std.testing.expectEqual(@as(usize, 1), arr.count());
+}
+
+test "deinit 幂等" {
+    var arr = try Array.initCapacity(std.testing.allocator, 4);
+    _ = try arr.insert("k", "v");
+    arr.deinit();
+    arr.deinit(); // 再次调用不应崩溃，也不应重复释放
+    try std.testing.expectEqual(@as(usize, 0), arr.count());
+    try std.testing.expectEqual(@as(usize, 0), arr.capacity());
+}
+
+test "槽位布局与 C 版对齐：Item 为 32 字节" {
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(Item));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(?[]u8));
+}
